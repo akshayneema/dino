@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# %%
+
 import argparse
 import os
 import sys
@@ -18,6 +21,7 @@ import datetime
 import time
 import math
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -29,10 +33,16 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+from eru.slide import SlideArray, SlideDataset, D
+from eru import constants
+from eru.models import point_geometries
+from torch.utils.data import Dataset
 
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+
+# %%
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -128,6 +138,25 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
+# %%
+
+class DINODataset(Dataset):
+    def __init__(
+            self,
+            slide_dataset: SlideDataset,
+            transform=None
+    ):
+        self.sd = slide_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.sd)
+    
+    def __getitem__(self, idx):
+        image = Image.fromarray(self.sd[idx]['patch'])
+        return self.transform(image)
+
+# %%
 
 def train_dino(args):
     utils.init_distributed_mode(args)
@@ -142,17 +171,33 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+
+    ## valar dataset here 
+    train_sa = SlideArray.load(list((constants.SLIDESDIR / f'bladder/utmb/he').glob('*A.tif')), progress=True)
+    train_index = point_geometries(train_sa, 512)["512"]
+
+    num_train = train_index.dims['sample']
+    train_indices = random.sample(range(num_train), 2048)
+    train_index = train_index.isel(sample=train_indices)
+
+    train_sd = SlideDataset.load(
+        train_sa, index_=train_index, fovs=D(512,1)
+    )
+
+    train_dataset = DINODataset(train_sd, transform)
+
+    sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
     )
-    print(f"Data loaded: there are {len(dataset)} images.")
+
+    print(f"Data loaded: there are {len(train_dataset)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
